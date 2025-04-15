@@ -1,0 +1,549 @@
+---
+title: EHS metrics - HHRIP
+subtitle:
+author:
+  - name: Eliot Monaco
+    affiliation:
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_notebook
+---
+
+# Purpose
+
+This is an analysis of Healthy Homes Rental Inspection Program inspections data set. Data quality is checked, and mean days to resolution is calculated for complaints.
+
+Data for this analysis is from the Inspection History Table. Each row represents one inspection. Complaints may involve more than one inspection, therefore the table is pivoted so that each row represents one complaint. Only complaints that begin on or after 2023-01-01 are summarized. The start date for a complaint is the date of the first "Complaint" inspection. The end date is the date of the last "Admin Closure" or "Desk Approval" inspection.
+
+# Set up environment and import data
+
+```{r setup}
+knitr::opts_chunk$set(
+  fig.width = 9,
+  fig.height = 4
+)
+```
+
+```{r message=FALSE}
+library(tidyverse)
+library(readxl)
+library(setmeup)
+library(openxlsx2)
+```
+
+Import inspections data.
+
+```{r}
+insp1 <- read_excel(
+  "../data/1-source/InspectionHistoryTable.xlsx",
+  .name_repair = ~ fix_colnames(.x, n_pfx = "var_")
+)
+```
+
+# Prep data
+
+Convert `inspection_date` from POSIXct to Date class.
+
+```{r}
+insp1$inspection_date <- as.Date(insp1$inspection_date)
+```
+
+## Validation
+
+Count missing values.
+
+```{r}
+vars <- c(
+  "id",
+  "complaint_id",
+  "inspection_type",
+  "inspection_date",
+  "property_zip_code"
+)
+
+data.frame(
+  variable = vars,
+  n_missing = unlist(lapply(vars, \(x) sum(is.na(insp1[[x]]))))
+)
+```
+
+```{r}
+dt <- as.Date("2023-01-01")
+```
+
+Rows missing a `complaint_id` pre- & post-`r as.character(dt)`.
+
+```{r}
+data.frame(
+  pre = nrow(insp1[is.na(insp1$complaint_id) & insp1$inspection_date < dt, ]),
+  post = nrow(insp1[is.na(insp1$complaint_id) & insp1$inspection_date >= dt, ])
+)
+```
+
+Non-numeric `id`s.
+
+```{r}
+insp1 |>
+  filter(grepl("\\D", id)) |>
+  arrange(id) |>
+  distinct(id)
+```
+
+Duplicate `id`s.
+
+```{r}
+any(duplicated(insp1$id))
+```
+
+Non-numeric `complaint_id`s.
+
+```{r}
+insp1 |>
+  filter(grepl("\\D", complaint_id)) |>
+  filter(!grepl("^\\d+\\.\\d+$", complaint_id)) |>
+  arrange(complaint_id) |>
+  distinct(complaint_id)
+```
+
+Invalid `inspection_date`s (dates occur after data export).
+
+```{r}
+insp1 |>
+  filter(inspection_date > as.Date("2025-03-26")) |>
+  arrange(inspection_date) |>
+  select(inspection_date)
+```
+
+Validate `inspection_type` values.
+
+```{r}
+insp1 |>
+  group_by(inspection_type) |>
+  count()
+```
+
+Invalid zip codes.
+
+```{r}
+insp1 |>
+  filter(!grepl("^\\d{5}$", property_zip_code)) |>
+  arrange(property_zip_code) |>
+  distinct(property_zip_code)
+```
+
+Clean zip codes.
+
+```{r}
+insp1 <- insp1 |>
+  mutate(property_zip_code = if_else(
+    grepl("\\d{5}", property_zip_code),
+    str_extract(property_zip_code, "\\d{5}"),
+    NA
+  ))
+```
+
+`complaint_id`s associated with > 1 zip code.
+
+```{r}
+insp1 |>
+  group_by(complaint_id, property_zip_code) |>
+  count() |>
+  ungroup() |>
+  find_dupes("complaint_id")
+```
+
+## Config
+
+- Select relevant variables.
+- Remove rows with missing or invalid data that cannot be included in the analysis.
+- Remove rows with dates after the data was exported.
+- Sort by `inspection_date`.
+- Assign ID to unique combinations of `complaint_id`, `inspection_type`, and `inspection_date`.
+
+```{r}
+insp2 <- insp1 |>
+  select(all_of(vars)) |>
+  filter(!if_any(c(complaint_id, inspection_type, inspection_date), is.na)) |>
+  filter(!inspection_date > as.Date("2025-03-26")) |>
+  arrange(inspection_date) |>
+  assign_id(
+    vars = c("complaint_id", "inspection_type", "inspection_date"),
+    id_name = "new_id",
+    prefix = "n"
+  )
+```
+
+Deduplicate on `new_id`.
+
+```{r}
+insp2 <- insp2 |>
+  distinct(new_id, .keep_all = TRUE)
+```
+
+Create a variable to number rows that have the same `complaint_id` and `inspection_type`.
+
+```{r}
+insp2$n <- ave(
+  x = insp2$id,
+  insp2$complaint_id,
+  insp2$inspection_type,
+  FUN = function(x) sprintf("%02d", seq_along(x))
+)
+```
+
+Combine `inspection_type` and `n` into new variable.
+
+```{r}
+insp2 <- insp2 |>
+  unite(
+    col = "inspection_type_n",
+    inspection_type, n,
+    sep = " ",
+    remove = TRUE,
+    na.rm = TRUE
+  )
+```
+
+Convert `inspection_type_n` to factor.
+
+```{r}
+vars <- unique(insp2$inspection_type_n)
+insp_types <- c("complaint", "reinspection", "field", "desk", "admin")
+p <- paste0("(?i)^", insp_types)
+lvl <- unlist(lapply(p, \(x) sort(vars[grepl(x, vars)])))
+
+insp2 <- insp2 |>
+  mutate(inspection_type_n = factor(inspection_type_n, levels = lvl))
+```
+
+```{r}
+insp2 |>
+  group_by(inspection_type_n) |>
+  count()
+```
+
+Pivot `insp2` to one row per complaint, one column per zip code.
+
+```{r}
+zips <- insp2 |>
+  select(id, complaint_id, property_zip_code) |>
+  distinct(complaint_id, property_zip_code, .keep_all = TRUE) |>
+  filter(!is.na(property_zip_code))
+
+zips$n <- ave(
+  x = zips$id,
+  zips$complaint_id,
+  FUN = seq_along
+)
+
+zips <- zips |>
+  select(-id) |>
+  mutate(zip = "zip") |>
+  pivot_wider(
+    names_from = c(zip, n),
+    values_from = property_zip_code
+  )
+```
+
+Pivot `insp2` to one row per complaint.
+
+```{r}
+comp1 <- insp2 |>
+  select(complaint_id, inspection_type_n, inspection_date) |>
+  pivot_wider(
+    names_from = inspection_type_n,
+    values_from = inspection_date,
+    names_sort = TRUE,
+    names_repair = fix_colnames
+  ) |>
+  arrange(complaint_01)
+```
+
+Join zip codes.
+
+```{r}
+comp1 <- comp1 |>
+  left_join(zips, by = "complaint_id")
+```
+
+Rows with multiple zip codes.
+
+```{r}
+comp1 |>
+  filter(!is.na(zip_2)) |>
+  select(complaint_id, starts_with("zip"))
+```
+
+Rows with multiple zip codes pre- & post-`r as.character(dt)`.
+
+```{r}
+data.frame(
+  pre = nrow(comp1[!is.na(comp1$zip_2) & comp1$complaint_01 < dt, ]),
+  post = nrow(comp1[!is.na(comp1$zip_2) & comp1$complaint_01 >= dt, ])
+)
+```
+
+Rows missing a complaint inspection.
+
+```{r}
+comp1 |>
+  filter(is.na(complaint_01))
+```
+
+## Check dates
+
+Check order of inspection dates.
+
+- Find minimum non-complaint inspection date.
+
+```{r}
+p <- paste0("^", insp_types[2:5], ".+\\d", collapse = "|")
+
+comp1$alt_min_date <- apply(
+  comp1[, grepl(p, colnames(comp1))],
+  1,
+  \(x) {
+    ifelse(
+      any(!is.na(x)),
+      min(x, na.rm = TRUE),
+      NA
+    )
+  }
+) |>
+  as.Date()
+```
+
+- Find maximum non-admin-closure/desk-approval inspection date.
+
+```{r}
+p <- paste0("^", insp_types[1:3], ".+\\d", collapse = "|")
+
+comp1$alt_max_date <- apply(
+  comp1[, grepl(p, colnames(comp1))],
+  1,
+  \(x) {
+    ifelse(
+      any(!is.na(x)),
+      max(x, na.rm = TRUE),
+      NA
+    )
+  }
+) |>
+  as.Date()
+```
+
+Rows where a non-complaint inspection precedes a complaint inspection.
+
+```{r}
+comp1 |>
+  filter(complaint_01 > alt_min_date)
+```
+
+Rows where a non-admin-closure/desk-approval inspection follows an admin closure or desk approval inspection.
+
+```{r}
+comp1 |>
+  filter(if_any(matches("^desk|^admin"), ~ .x < alt_max_date))
+```
+
+Find the range between the minimum and maximum dates per complaint.
+
+```{r}
+p <- paste0("^", insp_types, ".+\\d", collapse = "|")
+
+comp1$total_range <- apply(
+  comp1[, grepl(p, colnames(comp1))],
+  1,
+  \(x) {
+    ifelse(
+      any(!is.na(x)),
+      difftime(
+        as.Date(max(x, na.rm = TRUE)),
+        as.Date(min(x, na.rm = TRUE)),
+        units = "days"
+      ),
+      NA
+    )
+  }
+)
+```
+
+Plot ranges.
+
+```{r}
+comp1 |>
+  ggplot(aes(x = total_range)) +
+  geom_histogram(binwidth = 10)
+```
+
+Rows where `total_range` exceeds 1 year.
+
+```{r}
+comp1 |>
+  filter(total_range > 365)
+```
+
+## Time to resolution
+
+Filter by complaint inspection date on or after 2023-01-01.
+
+```{r}
+comp1 <- comp1 |>
+  filter(!is.na(complaint_01), complaint_01 >= dt)
+```
+
+Create `start_date` and `end_date` variables.
+
+```{r}
+comp1 <- comp1 |>
+  mutate(start_date = complaint_01)
+
+comp1$end_date <- apply(
+  comp1[, grepl("^desk|^admin", colnames(comp1))],
+  1,
+  \(x) {
+    ifelse(
+      any(!is.na(x)),
+      max(x, na.rm = TRUE),
+      NA
+    )
+  }
+) |>
+  as.Date()
+```
+
+Validate date order of `start_date` and `end_date`.
+
+```{r}
+comp1 <- comp1 |>
+  mutate(dates_sorted = is_sorted(start_date, end_date))
+
+comp1 |>
+  filter(!dates_sorted)
+```
+
+Remove rows with invalid date order.
+
+```{r}
+comp1 <- comp1 |>
+  filter(dates_sorted)
+```
+
+Calculate days to resolution.
+
+```{r}
+comp1 <- comp1 |>
+  mutate(
+    days_to_resolution = as.numeric(difftime(
+      end_date,
+      start_date,
+      units = "days"
+    )),
+    month_started = format(start_date, "%Y-%m"),
+    month_resolved = format(end_date, "%Y-%m")
+  )
+```
+
+# Summarize
+
+Summarize mean days to resolution by month.
+
+```{r}
+comp_by_mo <- comp1 |>
+  filter(!is.na(days_to_resolution)) |>
+  group_by(month_resolved) |>
+  summarize(
+    mean_days_to_res = mean(days_to_resolution),
+    n_resolved = n()
+  ) |>
+  ungroup()
+```
+
+Summarize mean days to resolution by ZIP code.
+
+```{r}
+comp_by_zip <- comp1 |>
+  filter(!is.na(days_to_resolution)) |>
+  filter(is.na(zip_2)) |>
+  group_by(zip_1) |>
+  summarize(
+    mean_days_to_res = mean(days_to_resolution),
+    n_resolved = n()
+  ) |>
+  ungroup()
+```
+
+Summarize resolved and unresolved complaints per month.
+
+```{r}
+comp_by_status <- comp1 |>
+  group_by(month_started) |>
+  summarize(
+    n_total = n(),
+    n_resolved = sum(!is.na(end_date)),
+    n_unresolved = sum(is.na(end_date))
+  ) |>
+  mutate(
+    pct_resolved = pct(n_resolved, n_total),
+    pct_unresolved = pct(n_unresolved, n_total)
+  )
+```
+
+# Plot
+
+Plot mean days to resolution.
+
+```{r}
+comp_by_mo |>
+  ggplot(aes(x = month_resolved, y = mean_days_to_res)) +
+  geom_col() +
+  guides(x = guide_axis(angle = 45))
+```
+
+# Save and export
+
+```{r}
+summary_tables <- list(
+  complaints_by_month = comp_by_mo,
+  complaints_by_zip = comp_by_zip,
+  complaints_by_status = comp_by_status
+)
+```
+
+```{r}
+saveRDS(summary_tables, "../data/3-final/complaint_summary_tables.rds")
+```
+
+```{r}
+sheet_names <- c(
+  "Month",
+  "ZIP code",
+  "Status"
+)
+
+wb <- wb_workbook()
+
+for (i in 1:length(summary_tables)) {
+  wb <- wb |>
+    wb_add_worksheet(sheet = sheet_names[i]) |>
+    wb_add_data(x = summary_tables[[i]])
+}
+
+wb_save(wb, "../output/Complaints_summary.xlsx")
+```
+
+# Data quality questions
+
+- Incorrect complaint IDs?
+- Incorrect inspection dates? Future dates, implausible date range, unexpected date order.
+- Missing data in `complaint_id`, `inspection_type`, `inspection_date`
+- Complaints that are missing a "Complaint" inspection (n)
+- Complaints that are missing an "Admin Closure" or "Desk Approval" inspection (n)
+- Complaints with multiple complaint inspections, or multiple admin closure or desk approval inspections
+
+To do
+
+- output tables
+- number of complaints dropped from 2023 on...
+- number of inspections dropped from 2023 due to lack of complaint_id value...
+
+
