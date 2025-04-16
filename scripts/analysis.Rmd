@@ -580,7 +580,7 @@ wb_save(wb, "../output/hhrip-complaints-summary.xlsx")
 
 # Data quality considerations
 
-Some issues were encountered that resulted in data being dropped from analyses (e.g., missing complaint IDs, or missing inspection dates for the starting or ending inspection types). Other issues were found that could skew the data if they are errors (e.g., unexpected or out of sequence dates), but they remain in the data because they are not invalid per se. The following table describes the complaints that were dropped from final summaries, however, more detail can be found in the preceding analysis.
+Some issues were encountered that resulted in data being dropped from analyses (e.g., missing complaint IDs, or missing inspection dates for the starting or ending inspection types). Other issues were found that could skew the data if they are errors (e.g., unexpected or out of sequence dates), but they remain in the data because they are not invalid per se. The following table describes complaints that were dropped from final summaries. More detail about potential data quality issues can be found in the preceding analysis.
 
 ```{r}
 data.frame(
