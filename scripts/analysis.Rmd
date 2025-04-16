@@ -384,6 +384,19 @@ comp1 |>
 
 ## Time to resolution
 
+```{r}
+# List to count complaints removed from summaries
+rmvd <- list()
+
+# Complaints removed due to missing "complaint" inspection date
+rmvd$no_comp_date <- list(
+  reason = "Missing inspection date for \"complaint\" inspection",
+  n = comp1 |>
+    filter(is.na(complaint_01)) |>
+    nrow()
+)
+```
+
 Filter by complaint inspection date on or after 2023-01-01.
 
 ```{r}
@@ -424,6 +437,14 @@ comp1 |>
 Remove rows with invalid date order.
 
 ```{r}
+# Complaints removed due to mis-ordered start and end dates
+rmvd$invalid_date_order <- list(
+  reason = "End date precedes start date",
+  n = comp1 |>
+    filter(!dates_sorted) |>
+    nrow()
+)
+
 comp1 <- comp1 |>
   filter(dates_sorted)
 ```
@@ -443,6 +464,24 @@ comp1 <- comp1 |>
   )
 ```
 
+```{r}
+# Complaints removed due to lack of end date
+rmvd$no_end_date <- list(
+  reason = "No desk approval or admin closure inspection date",
+  n = comp1 |>
+    filter(is.na(end_date)) |>
+    nrow()
+)
+
+# Complaints removed due to multiple ZIP codes
+rmvd$multiple_zips <- list(
+  reason = "Multiple ZIP codes",
+  n = comp1 |>
+    filter(!is.na(zip_2)) |>
+    nrow()
+)
+```
+
 # Summarize
 
 Summarize mean days to resolution by month.
@@ -452,7 +491,7 @@ comp_by_mo <- comp1 |>
   filter(!is.na(days_to_resolution)) |>
   group_by(month_resolved) |>
   summarize(
-    mean_days_to_res = mean(days_to_resolution),
+    mean_days_to_res = round_ties_away(mean(days_to_resolution), 1),
     n_resolved = n()
   ) |>
   ungroup()
@@ -466,7 +505,7 @@ comp_by_zip <- comp1 |>
   filter(is.na(zip_2)) |>
   group_by(zip_1) |>
   summarize(
-    mean_days_to_res = mean(days_to_resolution),
+    mean_days_to_res = round_ties_away(mean(days_to_resolution), 1),
     n_resolved = n()
   ) |>
   ungroup()
@@ -485,6 +524,14 @@ comp_by_status <- comp1 |>
   mutate(
     pct_resolved = pct(n_resolved, n_total),
     pct_unresolved = pct(n_unresolved, n_total)
+  ) |>
+  select(
+    month_started,
+    n_resolved,
+    pct_resolved,
+    n_unresolved,
+    pct_unresolved,
+    n_total
   )
 ```
 
@@ -528,22 +575,18 @@ for (i in 1:length(summary_tables)) {
     wb_add_data(x = summary_tables[[i]])
 }
 
-wb_save(wb, "../output/Complaints_summary.xlsx")
+wb_save(wb, "../output/hhrip-complaints-summary.xlsx")
 ```
 
-# Data quality questions
+# Data quality considerations
 
-- Incorrect complaint IDs?
-- Incorrect inspection dates? Future dates, implausible date range, unexpected date order.
-- Missing data in `complaint_id`, `inspection_type`, `inspection_date`
-- Complaints that are missing a "Complaint" inspection (n)
-- Complaints that are missing an "Admin Closure" or "Desk Approval" inspection (n)
-- Complaints with multiple complaint inspections, or multiple admin closure or desk approval inspections
+Some issues were encountered that resulted in data being dropped from analyses (e.g., missing complaint IDs, or missing inspection dates for the starting or ending inspection types). Other issues were found that could skew the data if they are errors (e.g., unexpected or out of sequence dates), but they remain in the data because they are not invalid per se. The following table describes the complaints that were dropped from final summaries, however, more detail can be found in the preceding analysis.
 
-To do
-
-- output tables
-- number of complaints dropped from 2023 on...
-- number of inspections dropped from 2023 due to lack of complaint_id value...
-
+```{r}
+data.frame(
+  reason = unlist(lapply(rmvd, `[`, 1)),
+  n = unlist(lapply(rmvd, `[`, 2)),
+  row.names = NULL
+)
+```
 
