@@ -49,6 +49,10 @@ insp1$inspection_date <- as.Date(insp1$inspection_date)
 
 ## Validation
 
+```{r}
+dq_review <- list()
+```
+
 Count missing values.
 
 ```{r}
@@ -67,15 +71,20 @@ data.frame(
 ```
 
 ```{r}
-dt <- as.Date("2023-01-01")
+# Data set earliest possible date
+dstart <- as.Date("2018-08-01")
+# Data set latest possible date
+dexport <- as.Date("2025-03-26")
+# Data set start date for metric calculations
+dmetrics <- as.Date("2023-01-01")
 ```
 
-Rows missing a `complaint_id` pre- & post-`r as.character(dt)`.
+Rows missing a `complaint_id` pre- & post-`r as.character(dmetrics)`.
 
 ```{r}
 data.frame(
-  pre = nrow(insp1[is.na(insp1$complaint_id) & insp1$inspection_date < dt, ]),
-  post = nrow(insp1[is.na(insp1$complaint_id) & insp1$inspection_date >= dt, ])
+  pre = nrow(insp1[is.na(insp1$complaint_id) & insp1$inspection_date < dmetrics, ]),
+  post = nrow(insp1[is.na(insp1$complaint_id) & insp1$inspection_date >= dmetrics, ])
 )
 ```
 
@@ -99,16 +108,37 @@ Non-numeric `complaint_id`s.
 ```{r}
 insp1 |>
   filter(grepl("\\D", complaint_id)) |>
-  filter(!grepl("^\\d+\\.\\d+$", complaint_id)) |>
+  filter(!grepl("^\\d+[\\.-]\\d+$", complaint_id)) |>
   arrange(complaint_id) |>
   distinct(complaint_id)
 ```
 
-Invalid `inspection_date`s (dates occur after data export).
+```{r}
+dq_review$problem_complaint_id <- insp1 |>
+  filter(
+    is.na(complaint_id) |
+      (grepl("\\D", complaint_id) & !grepl("^\\d+[\\.-]\\d+$", complaint_id))
+  ) |>
+  select(id, complaint_id, inspection_type, inspection_date) |>
+  arrange(complaint_id)
+```
+
+Invalid `inspection_date`s (dates occurring before program start date or after data export).
 
 ```{r}
+dq_review$invalid_date <- insp1 |>
+  filter(
+    inspection_date < dstart |
+      inspection_date > dexport
+  ) |>
+  select(id, complaint_id, inspection_type, inspection_date) |>
+  arrange(complaint_id)
+
 insp1 |>
-  filter(inspection_date > as.Date("2025-03-26")) |>
+  filter(
+    inspection_date < dstart |
+      inspection_date > dexport
+  ) |>
   arrange(inspection_date) |>
   select(inspection_date)
 ```
@@ -163,7 +193,7 @@ insp1 |>
 insp2 <- insp1 |>
   select(all_of(vars)) |>
   filter(!if_any(c(complaint_id, inspection_type, inspection_date), is.na)) |>
-  filter(!inspection_date > as.Date("2025-03-26")) |>
+  filter(!inspection_date > dexport) |>
   arrange(inspection_date) |>
   assign_id(
     vars = c("complaint_id", "inspection_type", "inspection_date"),
@@ -268,25 +298,41 @@ comp1 <- comp1 |>
 Rows with multiple zip codes.
 
 ```{r}
+dq_review$multiple_zip <- comp1 |>
+  filter(!is.na(zip_2))
+
 comp1 |>
   filter(!is.na(zip_2)) |>
   select(complaint_id, starts_with("zip"))
 ```
 
-Rows with multiple zip codes pre- & post-`r as.character(dt)`.
+Rows with multiple zip codes pre- & post-`r as.character(dmetrics)`.
 
 ```{r}
 data.frame(
-  pre = nrow(comp1[!is.na(comp1$zip_2) & comp1$complaint_01 < dt, ]),
-  post = nrow(comp1[!is.na(comp1$zip_2) & comp1$complaint_01 >= dt, ])
+  pre = nrow(comp1[!is.na(comp1$zip_2) & comp1$complaint_01 < dmetrics, ]),
+  post = nrow(comp1[!is.na(comp1$zip_2) & comp1$complaint_01 >= dmetrics, ])
 )
 ```
 
-Rows missing a complaint inspection.
+Rows missing an initial (complaint) inspection.
 
 ```{r}
+dq_review$missing_start_date <- comp1 |>
+  filter(is.na(complaint_01))
+
 comp1 |>
   filter(is.na(complaint_01))
+```
+
+Rows missing a final (admin closure or desk approval) inspection.
+
+```{r}
+dq_review$missing_end_date <- comp1 |>
+  filter(if_all(matches("^desk|^admin"), is.na))
+
+comp1 |>
+  filter(if_all(matches("^desk|^admin"), is.na))
 ```
 
 ## Check dates
@@ -334,6 +380,9 @@ comp1$alt_max_date <- apply(
 Rows where a non-complaint inspection precedes a complaint inspection.
 
 ```{r}
+dq_review$late_start_date <- comp1 |>
+  filter(complaint_01 > alt_min_date)
+
 comp1 |>
   filter(complaint_01 > alt_min_date)
 ```
@@ -341,6 +390,9 @@ comp1 |>
 Rows where a non-admin-closure/desk-approval inspection follows an admin closure or desk approval inspection.
 
 ```{r}
+dq_review$early_end_date <- comp1 |>
+  filter(if_any(matches("^desk|^admin"), ~ .x < alt_max_date))
+
 comp1 |>
   filter(if_any(matches("^desk|^admin"), ~ .x < alt_max_date))
 ```
@@ -401,7 +453,7 @@ Filter by complaint inspection date on or after 2023-01-01.
 
 ```{r}
 comp1 <- comp1 |>
-  filter(!is.na(complaint_01), complaint_01 >= dt)
+  filter(!is.na(complaint_01), complaint_01 >= dmetrics)
 ```
 
 Create `start_date` and `end_date` variables.
@@ -484,14 +536,18 @@ rmvd$multiple_zips <- list(
 
 # Summarize
 
+```{r}
+complaint_sum <- list()
+```
+
 Summarize mean days to resolution by month.
 
 ```{r}
-comp_by_mo <- comp1 |>
+complaint_sum$days_to_res_mo <- comp1 |>
   filter(!is.na(days_to_resolution)) |>
   group_by(month_resolved) |>
   summarize(
-    mean_days_to_res = round_ties_away(mean(days_to_resolution), 1),
+    mean_days_to_resolution = round_ties_away(mean(days_to_resolution), 1),
     n_resolved = n()
   ) |>
   ungroup()
@@ -500,21 +556,21 @@ comp_by_mo <- comp1 |>
 Summarize mean days to resolution by ZIP code.
 
 ```{r}
-comp_by_zip <- comp1 |>
-  filter(!is.na(days_to_resolution)) |>
-  filter(is.na(zip_2)) |>
-  group_by(zip_1) |>
-  summarize(
-    mean_days_to_res = round_ties_away(mean(days_to_resolution), 1),
-    n_resolved = n()
-  ) |>
-  ungroup()
+# complaint_sum$days_to_res_zip <- comp1 |>
+#   filter(!is.na(days_to_resolution)) |>
+#   filter(is.na(zip_2)) |>
+#   group_by(zip_1) |>
+#   summarize(
+#     mean_days_to_resolution = round_ties_away(mean(days_to_resolution), 1),
+#     n_resolved = n()
+#   ) |>
+#   ungroup()
 ```
 
 Summarize resolved and unresolved complaints per month.
 
 ```{r}
-comp_by_status <- comp1 |>
+complaint_sum$res_status <- comp1 |>
   group_by(month_started) |>
   summarize(
     n_total = n(),
@@ -540,53 +596,127 @@ comp_by_status <- comp1 |>
 Plot mean days to resolution.
 
 ```{r}
-comp_by_mo |>
-  ggplot(aes(x = month_resolved, y = mean_days_to_res)) +
+complaint_sum$days_to_res_mo |>
+  ggplot(aes(x = month_resolved, y = mean_days_to_resolution)) +
   geom_col() +
   guides(x = guide_axis(angle = 45))
 ```
 
-# Save and export
+Plot resolution status.
 
 ```{r}
-summary_tables <- list(
-  complaints_by_month = comp_by_mo,
-  complaints_by_zip = comp_by_zip,
-  complaints_by_status = comp_by_status
-)
+complaint_sum$res_status |>
+  rename(resolved = pct_resolved, unresolved = pct_unresolved) |>
+  pivot_longer(
+    cols = c(resolved, unresolved),
+    names_to = "resolution_status",
+    values_to = "pct"
+  ) |>
+  ggplot(aes(x = month_started, y = pct, fill = resolution_status)) +
+  geom_bar(stat = "identity") +
+  scale_y_reverse() +
+  guides(x = guide_axis(angle = 45))
 ```
 
-```{r}
-saveRDS(summary_tables, "../data/3-final/complaint_summary_tables.rds")
-```
+# Data quality review
 
-```{r}
-sheet_names <- c(
-  "Month",
-  "ZIP code",
-  "Status"
-)
-
-wb <- wb_workbook()
-
-for (i in 1:length(summary_tables)) {
-  wb <- wb |>
-    wb_add_worksheet(sheet = sheet_names[i]) |>
-    wb_add_data(x = summary_tables[[i]])
-}
-
-wb_save(wb, "../output/hhrip-complaints-summary.xlsx")
-```
-
-# Data quality considerations
-
-Some issues were encountered that resulted in data being dropped from analyses (e.g., missing complaint IDs, or missing inspection dates for the starting or ending inspection types). Other issues were found that could skew the data if they are errors (e.g., unexpected or out of sequence dates), but they remain in the data because they are not invalid per se. The following table describes complaints that were dropped from final summaries. More detail about potential data quality issues can be found in the preceding analysis.
+The following data quality issues were found. Records will be exported and provided to HHRIP for review.
 
 ```{r}
 data.frame(
-  reason = unlist(lapply(rmvd, `[`, 1)),
-  n = unlist(lapply(rmvd, `[`, 2)),
+  reason = names(dq_review),
+  total = unlist(lapply(dq_review, nrow)),
+  since_2023 = unlist(lapply(
+    dq_review,
+    \(x) {
+      if ("complaint_01" %in% colnames(x) && any(!is.na(x$complaint_01))) {
+        x |>
+          filter(complaint_01 >= dmetrics) |>
+          nrow()
+      } else {
+        NA
+      }
+    }
+  )),
   row.names = NULL
 )
 ```
 
+# Save and export
+
+## Metrics summaries
+
+```{r}
+saveRDS(complaint_sum, "../data/3-final/complaint_summary_tables.rds")
+```
+
+```{r}
+complaint_sum2 <- complaint_sum |>
+  lapply(\(x) {
+    colnames(x) <- colnames(x) |>
+      gsub(pattern = "_", replacement = " ") |>
+      str_replace(pattern = "^(n|pct)\\s(.+)$", replacement = "\\2 (\\1)") |>
+      str_replace(pattern = "\\(pct\\)", replacement = "\\(%\\)") |>
+      str_to_sentence()
+    x
+  })
+```
+
+```{r}
+sheet_names <- c(
+  "Days to resolution",
+  "Resolution status"
+)
+
+wb <- wb_workbook()
+
+for (i in 1:length(complaint_sum2)) {
+  wb <- wb |>
+    wb_add_worksheet(sheet = sheet_names[i]) |>
+    wb_add_data(x = complaint_sum2[[i]])
+}
+
+wb_save(wb, "../output/hhrip-complaint-metric-summary.xlsx")
+```
+
+## Records to review
+
+```{r}
+saveRDS(dq_review, "../data/3-final/data_quality_review_tables.rds")
+```
+
+```{r}
+ls <- "
+The tables in this file contain rows that didn't pass certain quality checks
+performed on the Inspection History Table.
+
+- Problem complaint ID: complaint_id is missing or contains unexpected characters
+- Invalid date: inspection_date is outside the expected date range for the data set
+- Multiple ZIP: multiple ZIP codes associated with the same complaint_id
+- Missing start date: complaint_id has no Complaint inspection
+- Missing end date: complaint_id has no Desk Approval or Admin Closure inspection
+- Late start date: Complaint inspection occurs after another inspection type
+- Early end date: Desk Approval or Admin Closure inspection occurs before
+  another inspection type
+"
+
+ls <- strsplit(ls, "\\n")
+names(ls) <- "data_note"
+dq_review <- c(ls, dq_review)
+```
+
+```{r}
+sheet_names <- names(dq_review) |>
+  gsub(pattern = "_", replacement = " ") |>
+  str_to_sentence()
+
+wb <- wb_workbook()
+
+for (i in 1:length(dq_review)) {
+  wb <- wb |>
+    wb_add_worksheet(sheet = sheet_names[i]) |>
+    wb_add_data(x = dq_review[[i]])
+}
+
+wb_save(wb, "../output/hhrip-data-quality-review.xlsx")
+```
